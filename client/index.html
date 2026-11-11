@@ -1,0 +1,31 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Omlet Arcade PC</title>
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🍊</text></svg>">
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <header id="topbar">
+    <a href="#/" class="logo">🍊 Omlet&nbsp;<b>Arcade</b><span class="pc-badge">PC</span></a>
+    <nav id="mainnav">
+      <a href="#/" data-nav="home">Главная</a>
+    </nav>
+    <div class="topbar-right">
+      <button id="golive-btn" class="btn-primary" title="Начать трансляцию экрана">▶ В эфир</button>
+      <div id="userchip"></div>
+    </div>
+  </header>
+
+  <main id="app">
+    <div class="loading">Загрузка…</div>
+  </main>
+
+  <div id="modal-root"></div>
+  <div id="toast-root"></div>
+
+  <script src="app.js"></script>
+</body>
+</html>
