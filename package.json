@@ -1,0 +1,19 @@
+{
+  "name": "omlet-arcade-pc",
+  "version": "1.0.0",
+  "description": "Fan revival of Omlet Arcade for PC — live streaming platform (web client + Node.js server + Turso DB)",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node server.js"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "@libsql/client": "^0.18.0",
+    "express": "^5.3.0",
+    "ws": "^8.22.2"
+  }
+}
