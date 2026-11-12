@@ -1,564 +1,1019 @@
-/* Omlet Arcade PC — клиент (vanilla JS SPA) */
+'use strict';
+/* 🍊 Omlet Arcade PC — клиент: лента, Discover, эфиры, ЛС, уведомления, гильдии */
 
-const S = {
-  token: localStorage.getItem('oapc_token') || null,
-  user: JSON.parse(localStorage.getItem('oapc_user') || 'null'),
-  ws: null,
-  screen: null,          // MediaStream (у хоста)
-  pc: null,              // RTCPeerConnection (у зрителя)
-  peers: new Map(),      // у хоста: peerId -> RTCPeerConnection
-  currentStream: null,
-  ended: false,
-};
-
-const GAMES = ['Minecraft PE', 'Roblox', 'PUBG Mobile', 'Standoff 2', 'Genshin Impact', 'Brawl Stars', 'Free Fire', 'Другое'];
-const ICE_CONFIG = { iceServers: [{ urls: ['stun:stun.l.google.com:19302', 'stun:stun1.l.google.com:19302'] }] };
-
+/* ============================== helpers ============================== */
 const $ = (s) => document.querySelector(s);
-const app = $('#app');
+const esc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 
-/* ------------------------------------------------------------------ utils */
-function esc(s) {
-  return String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
-}
+const tok = () => localStorage.getItem('omlet_token') || '';
+const me = () => { try { return JSON.parse(localStorage.getItem('omlet_user') || 'null'); } catch { return null; } };
+const setAuth = (t, u) => { localStorage.setItem('omlet_token', t); localStorage.setItem('omlet_user', JSON.stringify(u)); };
+const logout = () => { localStorage.removeItem('omlet_token'); localStorage.removeItem('omlet_user'); try { ws && ws.close(); } catch {} location.reload(); };
 
-function toast(text, isError = false) {
-  const el = document.createElement('div');
-  el.className = 'toast' + (isError ? ' error' : '');
-  el.textContent = text;
-  $('#toast-root').appendChild(el);
-  setTimeout(() => el.remove(), 3500);
-}
-
-function avatarHTML(user, size = 30) {
-  const letter = (user?.username || '?')[0];
-  return `<span class="avatar" style="width:${size}px;height:${size}px;font-size:${size * 0.45}px;background:${user?.avatar_color || '#555'}">${esc(letter)}</span>`;
-}
-
-function timeAgo(ts) {
-  const d = Math.floor((Date.now() - ts) / 1000);
-  if (d < 60) return 'только что';
-  if (d < 3600) return `${Math.floor(d / 60)} мин назад`;
-  if (d < 86400) return `${Math.floor(d / 3600)} ч назад`;
-  return `${Math.floor(d / 86400)} дн назад`;
-}
-
-async function api(path, opts = {}) {
-  const res = await fetch('/api' + path, {
-    method: opts.method || 'GET',
-    headers: {
-      'Content-Type': 'application/json',
-      ...(S.token ? { Authorization: 'Bearer ' + S.token } : {}),
-    },
-    body: opts.body !== undefined ? JSON.stringify(opts.body) : undefined,
+async function api(method, path, body) {
+  const r = await fetch(path, {
+    method,
+    headers: { 'content-type': 'application/json', ...(tok() ? { authorization: 'Bearer ' + tok() } : {}) },
+    body: body === undefined ? undefined : JSON.stringify(body),
   });
-  const data = await res.json().catch(() => ({}));
-  if (!res.ok) throw new Error(data.error || 'Ошибка запроса');
+  const data = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error(data.error || 'Ошибка сервера ' + r.status);
   return data;
 }
 
-function wsUrl(streamId) {
-  const proto = location.protocol === 'https:' ? 'wss' : 'ws';
-  const q = new URLSearchParams({ stream: streamId });
-  if (S.token) q.set('token', S.token);
-  return `${proto}://${location.host}/ws?${q}`;
+function timeAgo(ts) {
+  const s = Math.max(0, (Date.now() - Number(ts || 0)) / 1000);
+  if (s < 60) return 'только что';
+  if (s < 3600) return Math.floor(s / 60) + ' мин назад';
+  if (s < 86400) return Math.floor(s / 3600) + ' ч назад';
+  return Math.floor(s / 86400) + ' дн назад';
 }
 
-function setAuth(token, user) {
-  S.token = token; S.user = user;
-  if (token) { localStorage.setItem('oapc_token', token); localStorage.setItem('oapc_user', JSON.stringify(user)); }
-  else { localStorage.removeItem('oapc_token'); localStorage.removeItem('oapc_user'); }
-  renderUserChip();
+function avatarHTML(u, size = 40) {
+  const letter = (u?.username || '?')[0].toUpperCase();
+  return `<div class="avatar" style="width:${size}px;height:${size}px;background:${esc(u?.avatar_color || '#555')};font-size:${Math.round(size * 0.45)}px">${esc(letter)}</div>`;
 }
 
-function renderUserChip() {
-  const chip = $('#userchip');
-  if (S.user) {
-    chip.innerHTML = `
-      <a href="#/u/${esc(S.user.username)}" style="display:flex;align-items:center;gap:8px">
-        ${avatarHTML(S.user, 32)}
-        <span style="font-weight:700;font-size:14px">${esc(S.user.username)}</span>
-      </a>
-      <button class="btn-ghost" id="logout-btn" style="padding:6px 12px;font-size:12px">Выйти</button>`;
-    $('#logout-btn').onclick = () => { setAuth(null, null); toast('Вы вышли из аккаунта'); route(); };
+function toast(msg, ms = 3400) {
+  const d = document.createElement('div');
+  d.className = 'toast';
+  d.textContent = msg;
+  $('#toasts').appendChild(d);
+  setTimeout(() => d.remove(), ms);
+}
+
+function modal(html, title) {
+  closeModal();
+  const root = $('#modal-root');
+  root.innerHTML = `<div class="modal-overlay" id="modal-overlay"><div class="modal-panel">
+    <div class="modal-head"><span>${esc(title)}</span><button class="icon-btn" id="modal-close">✕</button></div>
+    ${html}</div></div>`;
+  $('#modal-close').onclick = closeModal;
+  $('#modal-overlay').addEventListener('click', (e) => { if (e.target.id === 'modal-overlay') closeModal(); });
+}
+function closeModal() { $('#modal-root').innerHTML = ''; }
+
+const COLORS = ['#FF7A00', '#FF4D4D', '#2ECC71', '#3498DB', '#9B59B6', '#F1C40F', '#1ABC9C', '#E91E63'];
+const GAME_ICONS = {
+  'Minecraft PE': '⛏️', 'Roblox': '🧱', 'PUBG Mobile': '🪖', 'Standoff 2': '🔫',
+  'Genshin Impact': '🌸', 'Brawl Stars': '💥', 'Free Fire': '🔥', 'Другое': '🎮',
+};
+const gameIcon = (g) => GAME_ICONS[g] || '🎮';
+
+/* ============================== state / ws ============================== */
+const state = { screen: 'home', dialogUser: null, guildId: null, watchId: null, watchMode: 'viewer', user: null, rtmpUrl: null, selColor: null };
+let ws = null, streamWS = null, guildWS = null;
+let notifUnread = 0, dmUnread = 0;
+let screenStream = null, recorder = null, rtmpActive = false, viewerPC = null;
+let pcs = new Map(), pendingPeers = new Set(), readyTimer = null;
+
+function updateBadges() {
+  const bell = $('#bell-badge');
+  if (bell) { const n = notifUnread; bell.textContent = n > 99 ? '99+' : n || ''; bell.style.display = n ? '' : 'none'; }
+  const tab = $('#nav-badge-msg');
+  if (tab) { const n = dmUnread; tab.textContent = n > 99 ? '99+' : n || ''; tab.style.display = n ? '' : 'none'; }
+  const total = notifUnread + dmUnread;
+  document.title = (total ? `(${total}) ` : '') + '🍊 Omlet Arcade PC';
+}
+
+function connectWS() {
+  try { ws && ws.close(); } catch {}
+  const proto = location.protocol === 'https:' ? 'wss://' : 'ws://';
+  ws = new WebSocket(`${proto}${location.host}/ws?token=${tok()}`);
+  ws.onmessage = (ev) => {
+    let m; try { m = JSON.parse(ev.data); } catch { return; }
+    if (m.type === 'personal-welcome') { notifUnread = m.unread || 0; updateBadges(); }
+    else if (m.type === 'dm') onDmPush(m);
+    else if (m.type === 'notification') onNotifPush(m);
+  };
+  ws.onclose = () => { setTimeout(() => { if (me()) connectWS(); }, 5000); };
+}
+
+function onDmPush(m) {
+  if (state.screen === 'dialog' && state.dialogUser === m.from.username) {
+    $('#dm-list')?.insertAdjacentHTML('beforeend', dmBubble({ sender_id: m.from.id, text: m.text, created_at: m.ts }));
+    const list = $('#dm-list'); if (list) list.scrollTop = list.scrollHeight;
   } else {
-    chip.innerHTML = `<button class="btn-ghost" id="login-btn">Войти</button>`;
-    $('#login-btn').onclick = () => openAuthModal('login');
+    dmUnread++;
+    updateBadges();
+    toast('💬 ' + m.from.username + ': ' + m.text.slice(0, 50));
+    if (state.screen === 'messages') render();
   }
 }
 
-/* ------------------------------------------------------------------ modal */
-function openModal(html) {
-  const root = $('#modal-root');
-  root.innerHTML = `<div class="modal-backdrop"></div><div class="modal">${html}</div>`;
-  root.classList.add('open');
-  root.querySelector('.modal-backdrop').onclick = closeModal;
-  return root.querySelector('.modal');
-}
-function closeModal() {
-  const root = $('#modal-root');
-  root.classList.remove('open');
-  root.innerHTML = '';
-}
-
-function openAuthModal(mode = 'login') {
-  const isLogin = mode === 'login';
-  const m = openModal(`
-    <h2>${isLogin ? 'Вход' : 'Регистрация'}</h2>
-    <label>Ник</label>
-    <input type="text" id="auth-username" maxlength="20" placeholder="например, ProGamer_2026" autocomplete="username">
-    <label>Пароль</label>
-    <input type="password" id="auth-password" placeholder="минимум 6 символов" autocomplete="current-password">
-    <div class="form-error" id="auth-error"></div>
-    <div class="actions">
-      <button class="btn-primary" id="auth-submit">${isLogin ? 'Войти' : 'Создать аккаунт'}</button>
-    </div>
-    <div class="switch-auth">${isLogin ? 'Нет аккаунта? <a id="auth-switch">Зарегистрироваться</a>' : 'Уже есть аккаунт? <a id="auth-switch">Войти</a>'}</div>
-  `);
-  m.querySelector('#auth-switch').onclick = () => openAuthModal(isLogin ? 'register' : 'login');
-  m.querySelector('#auth-password').addEventListener('keydown', (e) => { if (e.key === 'Enter') submit(); });
-  const submit = async () => {
-    const username = m.querySelector('#auth-username').value.trim();
-    const password = m.querySelector('#auth-password').value;
-    const err = m.querySelector('#auth-error');
-    err.textContent = '';
-    try {
-      const data = await api(isLogin ? '/login' : '/register', { method: 'POST', body: { username, password } });
-      setAuth(data.token, data.user);
-      closeModal();
-      toast(isLogin ? `С возвращением, ${data.user.username}!` : 'Аккаунт создан! Добро пожаловать 🎉');
-      route();
-    } catch (e) { err.textContent = e.message; }
+function onNotifPush(m) {
+  notifUnread++;
+  updateBadges();
+  const texts = {
+    live: `🔴 ${m.payload.host} вышел в эфир!`,
+    like: `❤️ ${m.payload.by} лайкнул твой пост`,
+    comment: `💬 ${m.payload.by}: ${(m.payload.text || '').slice(0, 40)}`,
+    follow: `➕ ${m.payload.by} подписался на тебя`,
   };
-  m.querySelector('#auth-submit').onclick = submit;
+  toast(texts[m.ntype] || '🔔 Новое уведомление');
+  if (state.screen === 'home' && m.ntype === 'live') render();
 }
 
-/* -------------------------------------------------------------- go live */
-async function goLiveFlow() {
-  if (!S.user) { openAuthModal('login'); return; }
-  const m = openModal(`
-    <h2>🍊 Начать эфир</h2>
-    <label>Название трансляции</label>
-    <input type="text" id="gl-title" maxlength="100" placeholder="Например: Стримим Minecraft, заходи!">
-    <label>Игра</label>
-    <select id="gl-game">${GAMES.map((g) => `<option>${esc(g)}</option>`).join('')}</select>
-    <div class="preview-strip" id="gl-preview">📺 Экран ещё не выбран</div>
-    <div class="form-error" id="gl-error"></div>
-    <div class="actions">
-      <button class="btn-ghost" id="gl-pick">Выбрать экран</button>
-      <button class="btn-primary" id="gl-start" disabled>В эфир!</button>
-    </div>
-  `);
-  const preview = m.querySelector('#gl-preview');
-  const startBtn = m.querySelector('#gl-start');
-  m.querySelector('#gl-pick').onclick = async () => {
-    try {
-      S.screen = await navigator.mediaDevices.getDisplayMedia({
-        video: { frameRate: 30 }, audio: true,
-      });
-      preview.classList.add('ok');
-      preview.textContent = '✅ Экран захвачен: ' + (S.screen.getVideoTracks()[0].label || 'источник');
-      startBtn.disabled = false;
-      S.screen.getVideoTracks()[0].addEventListener('ended', () => {
-        preview.classList.remove('ok');
-        preview.textContent = '📺 Экран ещё не выбран';
-        startBtn.disabled = true;
-      });
-    } catch (e) {
-      m.querySelector('#gl-error').textContent = 'Захват экрана отменён';
-    }
-  };
-  startBtn.onclick = async () => {
-    try {
-      startBtn.disabled = true;
-      const { stream } = await api('/streams', { method: 'POST', body: { title: m.querySelector('#gl-title').value, game: m.querySelector('#gl-game').value } });
-      S.currentStream = stream;
-      closeModal();
-      location.hash = '#/live/' + stream.id;
-    } catch (e) {
-      m.querySelector('#gl-error').textContent = e.message;
-      startBtn.disabled = false;
-    }
-  };
+/* ============================== каркас ============================== */
+const TABS = [
+  { id: 'home', icon: '🏠', label: 'Главная' },
+  { id: 'discover', icon: '🧭', label: 'Открытия' },
+  { id: 'live', icon: '⏺', label: 'В эфир' },
+  { id: 'messages', icon: '💬', label: 'Сообщения', badge: 'msg' },
+  { id: 'profile', icon: '👤', label: 'Профиль' },
+];
+const BACK_TO = { watch: 'live', golive: 'live', dialog: 'messages', user: 'discover', guild: 'discover' };
+
+function renderNav() {
+  $('#nav').innerHTML = TABS.map((t) => `
+    <button class="nav-btn ${state.screen === t.id ? 'active' : ''}" data-nav="${t.id}">
+      <span class="nav-icon">${t.icon}${t.badge === 'msg' ? '<span id="nav-badge-msg" class="badge"></span>' : ''}</span>
+      <span class="nav-label">${t.label}</span>
+    </button>`).join('');
+  updateBadges();
 }
 
-/* --------------------------------------------------------------- routing */
-function cleanupLive() {
-  if (S.ws) { try { S.ws.close(); } catch {} S.ws = null; }
-  for (const pc of S.peers.values()) { try { pc.close(); } catch {} }
-  S.peers.clear();
-  if (S.pc) { try { S.pc.close(); } catch {} S.pc = null; }
-  if (S.screen) {
-    for (const t of S.screen.getTracks()) t.stop();
-    S.screen = null;
-  }
-  S.currentStream = null;
-  S.ended = false;
+function header(title, back) {
+  $('#header').innerHTML = `<div class="header-inner">
+    ${back ? '<button id="btn-back" class="icon-btn">←</button>' : '<div class="logo-mini">🍊</div>'}
+    <div class="header-title">${esc(title)}</div>
+    ${me() ? '<button id="btn-bell" class="icon-btn" title="Уведомления">🔔<span id="bell-badge" class="badge"></span></button>' : ''}
+  </div>`;
+  const b = $('#btn-back'); if (b) b.onclick = () => nav(back);
+  const bell = $('#btn-bell'); if (bell) bell.onclick = openNotifications;
+  updateBadges();
 }
 
-window.addEventListener('hashchange', route);
-
-async function route() {
-  cleanupLive();
-  const h = location.hash || '#/';
-  $('#mainnav').querySelectorAll('a').forEach((a) => a.classList.toggle('active', a.getAttribute('href') === '#/' && h === '#/'));
-  if (h.startsWith('#/live/')) return viewStream(h.slice(7));
-  if (h.startsWith('#/u/')) return viewProfile(decodeURIComponent(h.slice(4)));
-  return viewHome();
+function nav(screen, params = {}) {
+  if (!me() && screen !== 'auth') screen = 'auth';
+  if (state.screen === 'watch' && screen !== 'watch') cleanupStream();
+  if (state.screen === 'guild' && screen !== 'guild') { try { guildWS && guildWS.close(); } catch {} guildWS = null; }
+  state.screen = screen;
+  Object.assign(state, params);
+  closeModal();
+  window.scrollTo(0, 0);
+  render();
 }
 
-/* ------------------------------------------------------------------ home */
-async function viewHome() {
-  app.innerHTML = '<div class="loading">Загрузка эфиров…</div>';
-  let data;
-  try { data = await api('/streams'); } catch (e) { app.innerHTML = `<div class="empty">${esc(e.message)}</div>`; return; }
-
-  const liveCards = data.live.map(streamCard).join('');
-  const recentCards = data.recent.map(streamCard).join('');
-
-  app.innerHTML = `
-    <div class="hero">
-      <h1>Твои игры. Твой эфир. 🍊</h1>
-      <p>Omlet Arcade вернулся — теперь на ПК. Стримь свой экран, общайся в чате, подписывайся на стримеров.</p>
-      <button class="btn-primary" id="hero-golive" style="font-size:16px;padding:12px 26px">▶ Начать трансляцию</button>
-    </div>
-
-    <div class="section-title"><span class="dot"></span> Сейчас в эфире (${data.live.length})</div>
-    ${data.live.length ? `<div class="grid-streams">${liveCards}</div>` : '<div class="empty">Пока никто не стримит. Стань первым — нажми «В эфир»! 🔥</div>'}
-
-    <div class="section-title">📺 Недавние эфиры</div>
-    ${data.recent.length ? `<div class="grid-streams">${recentCards}</div>` : '<div class="empty">Здесь появятся завершённые эфиры</div>'}
-  `;
-  $('#hero-golive').onclick = goLiveFlow;
-  app.querySelectorAll('[data-stream]').forEach((el) => {
-    el.onclick = () => { location.hash = '#/live/' + el.dataset.stream; };
-  });
-}
-
-function streamCard(s) {
-  const isLive = s.status === 'live';
-  return `
-    <div class="stream-card" data-stream="${esc(s.id)}" style="cursor:pointer">
-      <div class="thumb" style="background:linear-gradient(135deg, ${esc(s.host_color || s.host_avatar_color || '#ff7a00')}33, #1a1e2a)">
-        ${isLive ? '<span class="live-badge">● LIVE</span>' : '<span class="offline-badge">офлайн</span>'}
-        ${isLive ? `<span class="viewers-badge">👁 ${s.viewers || 0}</span>` : ''}
-        <span>${esc(gameEmoji(s.game))}</span>
-      </div>
-      <div class="meta">
-        <div class="title">${esc(s.title)}</div>
-        <div class="byline">${avatarHTML({ username: s.host_username, avatar_color: s.host_color || s.host_avatar_color }, 22)}
-          <span>${esc(s.host_username)}</span><span>·</span><span>${timeAgo(isLive ? s.started_at : (s.ended_at || s.started_at))}</span></div>
-        <span class="game-tag">🎮 ${esc(s.game)}</span>
-      </div>
-    </div>`;
-}
-
-function gameEmoji(game) {
-  return { 'Minecraft PE': '⛏️', 'Roblox': '🟥', 'PUBG Mobile': '🔫', 'Standoff 2': '💥', 'Genshin Impact': '⚔️', 'Brawl Stars': '⭐', 'Free Fire': '🔥', 'Другое': '🎮' }[game] || '🎮';
-}
-
-/* ---------------------------------------------------------------- stream */
-async function viewStream(id) {
-  app.innerHTML = '<div class="loading">Подключаемся к эфиру…</div>';
-  let data;
-  try { data = await api('/streams/' + id); } catch { app.innerHTML = '<div class="empty">Эфир не найден 😢 <br><br><a href="#/" style="color:var(--accent2);font-weight:700">← На главную</a></div>'; return; }
-  const { stream, messages, host_followers } = data;
-  const isHost = !!S.user && S.user.id === stream.host_id;
-
-  app.innerHTML = `
-    <div class="stream-layout">
-      <div>
-        <div class="video-wrap" id="video-wrap">
-          <video id="stream-video" autoplay playsinline muted></video>
-          ${stream.status === 'live'
-            ? `<div class="video-placeholder" id="video-placeholder"><div class="spinner"></div><div>Ожидаем видеопоток…</div></div>`
-            : ''}
-          ${stream.status === 'live' ? '<div class="live-pill"><span class="dot"></span>LIVE</div><div class="viewers-pill" id="viewers-pill">👁 0</div>' : ''}
-          ${stream.status === 'ended' ? '<div class="offline-overlay"><div class="big">Эфир завершён</div><div style="color:var(--muted)">Загляни на главную — там ещё идут трансляции</div><a class="btn-primary" href="#/" style="margin-top:6px;display:inline-block">На главную</a></div>' : ''}
-        </div>
-        <div class="stream-info">
-          <h2>${esc(stream.title)}</h2>
-          <div class="row">
-            ${avatarHTML({ username: stream.host_username, avatar_color: stream.host_color }, 34)}
-            <a href="#/u/${esc(stream.host_username)}" style="font-weight:700;color:var(--text)">${esc(stream.host_username)}</a>
-            <span>· 👥 ${host_followers} подписчиков</span>
-            ${!isHost && S.user ? `<button class="btn-ghost" id="follow-btn" style="margin-left:auto">${''}</button>` : ''}
-            ${isHost ? '<button class="btn-danger" id="end-btn" style="margin-left:auto">■ Завершить эфир</button>' : ''}
-          </div>
-          <div style="margin-top:10px"><span class="game-tag">🎮 ${esc(stream.game)}</span>
-            <span class="game-tag">${isHost ? '🔴 ты в эфире' : timeAgo(stream.started_at)}</span></div>
-        </div>
-      </div>
-      <div class="chat-panel">
-        <h3>💬 ЧАТ ТРАНСЛЯЦИИ</h3>
-        <div id="chat-messages"></div>
-        ${S.user
-          ? `<div class="chat-input-row">
-               <input id="chat-input" maxlength="300" placeholder="Написать сообщение…">
-               <button id="chat-send">➤</button>
-             </div>`
-          : `<div class="chat-login-hint"><a id="chat-login">Войдите</a>, чтобы писать в чат</div>`}
-      </div>
-    </div>
-  `;
-
-  const video = $('#stream-video');
-  const placeholder = $('#video-placeholder');
-
-  const followBtn = $('#follow-btn');
-  if (followBtn) {
-    api('/users/' + stream.host_username).then((d) => {
-      updateFollowBtn(followBtn, d.is_following, stream.host_username);
-    }).catch(() => {});
-  }
-  const endBtn = $('#end-btn');
-  if (endBtn) endBtn.onclick = () => endLive(stream.id, true);
-
-  renderChatMessages(messages);
-
-  const chatInput = $('#chat-input');
-  if (chatInput) {
-    const send = () => {
-      const text = chatInput.value.trim();
-      if (!text || !S.ws || S.ws.readyState !== 1) return;
-      S.ws.send(JSON.stringify({ type: 'chat', text }));
-      chatInput.value = '';
-    };
-    $('#chat-send').onclick = send;
-    chatInput.addEventListener('keydown', (e) => { if (e.key === 'Enter') send(); });
-    chatInput.focus();
-  }
-  const chatLogin = $('#chat-login');
-  if (chatLogin) chatLogin.onclick = () => openAuthModal('login');
-
-  if (stream.status !== 'live') return;
-
-  // ---- websocket: видеосигналинг + чат
-  S.currentStream = stream;
-  S.ws = new WebSocket(wsUrl(stream.id));
-
-  S.ws.onmessage = (ev) => {
-    let msg; try { msg = JSON.parse(ev.data); } catch { return; }
-    switch (msg.type) {
-      case 'welcome':
-        updateViewers(msg.viewers);
-        S.ws.send(JSON.stringify({ type: 'ready' }));
-        if (!S.user) pushChatSystem('Только зарегистрированные могут писать в чат');
-        break;
-      case 'host-welcome':
-        updateViewers(msg.viewers);
-        if (isHost && S.screen) startHosting();
-        break;
-      case 'viewers':
-        updateViewers(msg.count);
-        break;
-      case 'peer-joined':
-        if (isHost) createHostPeer(msg.peerId);
-        break;
-      case 'signal':
-        handleSignal(msg);
-        break;
-      case 'chat':
-        pushChatMessage(msg);
-        break;
-      case 'stream-ended':
-        S.ended = true;
-        pushChatSystem('Эфир завершён');
-        setTimeout(() => route(), 1500);
-        break;
-      case 'error':
-        if (msg.message === 'login_required') toast('Войдите, чтобы писать в чат', true);
-        break;
-    }
-  };
-
-  S.ws.onclose = () => { if (!S.ended && !isHost) pushChatSystem('Соединение потеряно…'); };
-
-  function startHosting() {
-    S.screen.getTracks().forEach((t) => {
-      if (t.kind === 'video') t.addEventListener('ended', () => endLive(stream.id, false));
-    });
-    video.srcObject = S.screen;
-    video.muted = true;
-    hidePlaceholder();
-    for (const [peerId] of S.peers) createHostPeer(peerId); // уже ждущие зрители
-  }
-
-  async function createHostPeer(peerId) {
-    if (!S.screen || S.peers.has(peerId)) return;
-    const pc = new RTCPeerConnection(ICE_CONFIG);
-    S.peers.set(peerId, pc);
-    S.screen.getTracks().forEach((track) => pc.addTrack(track, S.screen));
-    pc.onicecandidate = (e) => {
-      if (e.candidate) S.ws.send(JSON.stringify({ type: 'signal', to: peerId, data: { candidate: e.candidate } }));
-    };
-    const offer = await pc.createOffer();
-    await pc.setLocalDescription(offer);
-    S.ws.send(JSON.stringify({ type: 'signal', to: peerId, data: { sdp: pc.localDescription } }));
-  }
-
-  async function handleSignal(msg) {
-    if (isHost) {
-      const pc = S.peers.get(msg.from);
-      if (!pc) return;
-      if (msg.data.sdp) await pc.setRemoteDescription(msg.data.sdp);
-      else if (msg.data.candidate) await pc.addIceCandidate(msg.data.candidate).catch(() => {});
-    } else {
-      if (msg.data.sdp && msg.data.sdp.type === 'offer') {
-        const pc = new RTCPeerConnection(ICE_CONFIG);
-        S.pc = pc;
-        pc.ontrack = (e) => {
-          video.srcObject = e.streams[0];
-          video.muted = false;
-          hidePlaceholder();
-        };
-        pc.onicecandidate = (e) => {
-          if (e.candidate) S.ws.send(JSON.stringify({ type: 'signal', to: 'host', data: { candidate: e.candidate } }));
-        };
-        await pc.setRemoteDescription(msg.data.sdp);
-        const answer = await pc.createAnswer();
-        await pc.setLocalDescription(answer);
-        S.ws.send(JSON.stringify({ type: 'signal', to: 'host', data: { sdp: pc.localDescription } }));
-      } else if (msg.data.candidate && S.pc) {
-        await S.pc.addIceCandidate(msg.data.candidate).catch(() => {});
-      }
-    }
-  }
-
-  function updateViewers(n) {
-    const pill = $('#viewers-pill');
-    if (pill) pill.textContent = `👁 ${n}`;
-  }
-
-  function hidePlaceholder() {
-    if (placeholder) placeholder.remove();
-  }
-}
-
-/* ------------------------------------------------------------------ chat */
-function renderChatMessages(list) {
-  const box = $('#chat-messages');
-  if (!box) return;
-  for (const m of list) {
-    box.insertAdjacentHTML('beforeend', `
-      <div class="chat-msg">
-        <span class="uname" style="color:${esc(m.avatar_color)}" data-user="${esc(m.username)}">${esc(m.username)}:</span>
-        ${esc(m.text)}
-      </div>`);
-  }
-  bindUserLinks(box);
-  box.scrollTop = box.scrollHeight;
-}
-
-function pushChatMessage(m) {
-  const box = $('#chat-messages');
-  if (!box) return;
-  box.insertAdjacentHTML('beforeend', `
-    <div class="chat-msg">
-      <span class="uname" style="color:${esc(m.user.avatar_color)}" data-user="${esc(m.user.username)}">${esc(m.user.username)}:</span>
-      ${esc(m.text)}
-    </div>`);
-  bindUserLinks(box);
-  box.scrollTop = box.scrollHeight;
-}
-
-function pushChatSystem(text) {
-  const box = $('#chat-messages');
-  if (!box) return;
-  box.insertAdjacentHTML('beforeend', `<div class="chat-msg system">${esc(text)}</div>`);
-  box.scrollTop = box.scrollHeight;
-}
-
-function bindUserLinks(box) {
-  box.querySelectorAll('.uname[data-user]').forEach((el) => {
-    el.onclick = () => { location.hash = '#/u/' + el.dataset.user; };
-  });
-}
-
-/* --------------------------------------------------------------- go live */
-async function endLive(streamId, viaButton) {
+async function render() {
+  renderNav();
+  const scr = $('#screen');
   try {
-    await api(`/streams/${streamId}/end`, { method: 'POST' });
-  } catch {}
-  S.ended = true;
-  if (S.ws) { try { S.ws.close(); } catch {} S.ws = null; }
-  if (S.screen) { for (const t of S.screen.getTracks()) t.stop(); S.screen = null; }
-  toast(viaButton ? 'Эфир завершён' : 'Захват экрана остановлен — эфир завершён');
-  location.hash = '#/';
+    switch (state.screen) {
+      case 'auth': return renderAuth(scr);
+      case 'discover': return renderDiscover(scr);
+      case 'live': return renderLive(scr);
+      case 'golive': return renderGoLive(scr);
+      case 'watch': return renderWatch(scr);
+      case 'messages': return renderMessages(scr);
+      case 'dialog': return renderDialog(scr);
+      case 'user': return renderUser(scr);
+      case 'profile': return renderProfile(scr);
+      case 'guild': return renderGuild(scr);
+      default: return renderHome(scr);
+    }
+  } catch (e) {
+    console.error(e);
+    scr.innerHTML = `<div class="empty">⚠️ ${esc(e.message)}</div><div style="text-align:center"><button class="btn" data-nav="home">Повторить</button></div>`;
+  }
 }
 
-/* --------------------------------------------------------------- profile */
-function updateFollowBtn(btn, following, username) {
-  btn.textContent = following ? '✓ Вы подписаны' : '+ Подписаться';
-  btn.style.borderColor = following ? 'rgba(46,204,113,.5)' : '';
-  btn.onclick = async () => {
+/* ============================== клики (делегирование) ============================== */
+document.addEventListener('click', (e) => {
+  const q = (sel) => e.target.closest(sel);
+  let t;
+  if ((t = q('[data-like]'))) { e.stopPropagation(); return toggleLike(t); }
+  if ((t = q('[data-cmt]'))) { e.stopPropagation(); return toggleComments(t); }
+  if ((t = q('[data-follow]'))) { e.stopPropagation(); return toggleFollow(t.dataset.follow, t); }
+  if ((t = q('[data-gjoin]'))) { e.stopPropagation(); return toggleGuild(t.dataset.gjoin); }
+  if ((t = q('[data-dm]'))) { e.stopPropagation(); return nav('dialog', { dialogUser: t.dataset.dm }); }
+  if ((t = q('[data-user]'))) {
+    const uname = t.dataset.user;
+    if (!uname || uname === 'undefined') return;
+    return uname === me()?.username ? nav('profile') : nav('user', { user: uname });
+  }
+  if ((t = q('[data-stream]'))) return nav('watch', { watchId: t.dataset.stream, watchMode: 'viewer' });
+  if ((t = q('[data-guild]'))) return nav('guild', { guildId: t.dataset.guild });
+  if ((t = q('[data-nav]'))) return nav(t.dataset.nav);
+});
+
+/* ============================== авторизация ============================== */
+function renderAuth(scr) {
+  header('Добро пожаловать!');
+  $('#nav').style.display = 'none';
+  scr.innerHTML = `
+    <div class="auth">
+      <div class="auth-logo">🍊</div>
+      <h1>Omlet Arcade <span class="accent">PC</span></h1>
+      <p class="muted">Эфиры, гильдии и лента — как в мобильном Omlet Arcade, только на ПК</p>
+      <div class="auth-tabs">
+        <button class="auth-tab active" data-tab="login">Вход</button>
+        <button class="auth-tab" data-tab="reg">Регистрация</button>
+      </div>
+      <form id="f-login" class="auth-form">
+        <input name="username" placeholder="Ник" autocomplete="username" required>
+        <input name="password" type="password" placeholder="Пароль" autocomplete="current-password" required>
+        <button class="btn big">Войти</button>
+      </form>
+      <form id="f-reg" class="auth-form" style="display:none">
+        <input name="username" placeholder="Ник (латиница, 3–20)" autocomplete="username" required>
+        <input name="password" type="password" placeholder="Пароль (минимум 6)" autocomplete="new-password" required>
+        <button class="btn big">Создать аккаунт 🍊</button>
+      </form>
+    </div>`;
+  scr.querySelectorAll('.auth-tab').forEach((t) => t.onclick = () => {
+    scr.querySelectorAll('.auth-tab').forEach((x) => x.classList.toggle('active', x === t));
+    $('#f-login').style.display = t.dataset.tab === 'login' ? '' : 'none';
+    $('#f-reg').style.display = t.dataset.tab === 'reg' ? '' : 'none';
+  });
+  $('#f-login').onsubmit = async (e) => {
+    e.preventDefault();
     try {
-      const d = await api(`/users/${username}/follow`, { method: following ? 'DELETE' : 'POST' });
-      updateFollowBtn(btn, d.is_following, username);
-    } catch (e) { toast(e.message, true); }
+      const d = await api('POST', '/api/login', { username: e.target.username.value.trim(), password: e.target.password.value });
+      setAuth(d.token, d.user);
+      enterApp();
+    } catch (err) { toast(err.message); }
+  };
+  $('#f-reg').onsubmit = async (e) => {
+    e.preventDefault();
+    try {
+      const d = await api('POST', '/api/register', { username: e.target.username.value.trim(), password: e.target.password.value });
+      setAuth(d.token, d.user);
+      enterApp();
+      toast('Аккаунт создан! Добро пожаловать 🍊');
+    } catch (err) { toast(err.message); }
   };
 }
 
-async function viewProfile(username) {
-  app.innerHTML = '<div class="loading">Загрузка профиля…</div>';
-  let d;
-  try { d = await api('/users/' + encodeURIComponent(username)); } catch { app.innerHTML = '<div class="empty">Пользователь не найден</div>'; return; }
-  const isMe = S.user && S.user.id === d.user.id;
+function enterApp() {
+  notifUnread = 0; dmUnread = 0;
+  connectWS();
+  nav('home');
+}
 
-  app.innerHTML = `
-    <div class="profile-head">
-      ${avatarHTML(d.user, 76)}
-      <div>
-        <div style="font-size:22px;font-weight:800">${esc(d.user.username)}</div>
-        <div class="profile-stats">
-          <span><b>${d.followers}</b> подписчиков</span>
-          <span><b>${d.following}</b> подписок</span>
-          <span><b>${d.streams_total}</b> эфиров</span>
-        </div>
-        ${d.user.bio ? `<div class="profile-bio">${esc(d.user.bio)}</div>` : ''}
-      </div>
-      <div style="margin-left:auto;display:flex;gap:10px">
-        ${d.live_stream_id ? `<a class="btn-primary" href="#/live/${d.live_stream_id}" style="display:flex;align-items:center">● Смотреть эфир</a>` : ''}
-        ${!isMe && S.user ? `<button class="btn-ghost" id="follow-btn"></button>` : ''}
-        ${isMe ? '<button class="btn-ghost" id="edit-profile">Редактировать</button>' : ''}
+/* ============================== главная / лента ============================== */
+const liveCard = (s) => `
+  <div class="live-card" data-stream="${esc(s.id)}">
+    <div class="live-thumb">${gameIcon(s.game)}<span class="live-dot">LIVE</span></div>
+    <div class="live-card-title">${esc(s.title)}</div>
+    <div class="live-card-sub">${esc(s.host_username)} · 👁 ${s.viewers}</div>
+  </div>`;
+
+function postHTML(p) {
+  return `
+  <div class="post" data-post="${esc(p.id)}">
+    <div class="post-head">
+      ${avatarHTML(p, 40)}
+      <div class="row-main" data-user="${esc(p.username)}">
+        <div class="row-title">${esc(p.username)}</div>
+        <div class="muted tiny">${timeAgo(p.created_at)}</div>
       </div>
     </div>
-    <div class="section-title">🎮 Эфиры ${esc(d.user.username)}</div>
-    ${d.streams.length ? `<div class="grid-streams">${d.streams.map(streamCard).join('')}</div>` : '<div class="empty">Пока нет эфиров</div>'}
-  `;
-
-  const fb = $('#follow-btn');
-  if (fb) updateFollowBtn(fb, d.is_following, d.user.username);
-
-  const editBtn = $('#edit-profile');
-  if (editBtn) editBtn.onclick = () => {
-    const m = openModal(`
-      <h2>Профиль</h2>
-      <label>О себе</label>
-      <textarea id="pf-bio" maxlength="200" rows="3">${esc(d.user.bio)}</textarea>
-      <label>Цвет аватарки</label>
-      <input type="text" id="pf-color" value="${esc(d.user.avatar_color)}" placeholder="#FF7A00">
-      <div class="form-error" id="pf-error"></div>
-      <div class="actions"><button class="btn-primary" id="pf-save">Сохранить</button></div>
-    `);
-    m.querySelector('#pf-save').onclick = async () => {
-      try {
-        const resp = await api('/me', { method: 'PATCH', body: { bio: m.querySelector('#pf-bio').value, avatar_color: m.querySelector('#pf-color').value } });
-        setAuth(S.token, resp.user);
-        closeModal(); toast('Профиль обновлён'); route();
-      } catch (e) { m.querySelector('#pf-error').textContent = e.message; }
-    };
-  };
-
-  app.querySelectorAll('[data-stream]').forEach((el) => {
-    el.onclick = () => { location.hash = '#/live/' + el.dataset.stream; };
-  });
+    ${p.text ? `<div class="post-text">${esc(p.text).replace(/\n/g, '<br>')}</div>` : ''}
+    ${p.image ? `<img class="post-img" src="${esc(p.image)}" loading="lazy" alt="">` : ''}
+    <div class="post-actions">
+      <button class="pa ${p.liked ? 'liked' : ''}" data-like="${esc(p.id)}">❤ <span class="lc">${p.likes ?? 0}</span></button>
+      <button class="pa" data-cmt="${esc(p.id)}">💬 <span class="cc">${p.comments ?? 0}</span></button>
+    </div>
+    <div class="cbox" id="cbox-${esc(p.id)}" hidden></div>
+  </div>`;
 }
 
-/* ------------------------------------------------------------------ init */
-$('#golive-btn').onclick = goLiveFlow;
-renderUserChip();
-route();
+function fileToDataUrl(file, cb) {
+  const img = new Image();
+  img.onload = () => {
+    try {
+      const scale = Math.min(1, 1000 / img.width);
+      const c = document.createElement('canvas');
+      c.width = Math.round(img.width * scale);
+      c.height = Math.round(img.height * scale);
+      c.getContext('2d').drawImage(img, 0, 0, c.width, c.height);
+      let q = 0.85, url = c.toDataURL('image/jpeg', q);
+      while (url.length > 280000 && q > 0.35) { q -= 0.15; url = c.toDataURL('image/jpeg', q); }
+      cb(url);
+    } catch { cb(null); }
+  };
+  img.onerror = () => cb(null);
+  img.src = URL.createObjectURL(file);
+}
 
-// если открыли не с той страницы — норм, hash-роутер сам разберётся
-window.addEventListener('error', (e) => console.error('client error:', e.message));
+async function renderHome(scr) {
+  header('Главная');
+  $('#nav').style.display = '';
+  const [feedD, streamsD] = await Promise.all([api('GET', '/api/feed'), api('GET', '/api/streams')]);
+  const posts = feedD.posts || [];
+  const live = streamsD.live || [];
+  scr.innerHTML = `
+    ${live.length ? `<div class="section-title">🔴 Сейчас в эфире</div><div class="hscroll">${live.map(liveCard).join('')}</div>` : ''}
+    <div class="composer">
+      <textarea id="post-text" placeholder="Что нового? Делись моментами из игр…" maxlength="1000"></textarea>
+      <div class="composer-row">
+        <label class="icon-btn" title="Прикрепить картинку">🖼<input type="file" id="post-img" accept="image/*" hidden></label>
+        <span id="post-img-name" class="muted small"></span>
+        <button id="post-send" class="btn">Опубликовать</button>
+      </div>
+    </div>
+    <div class="section-title">📰 Лента</div>
+    <div id="feed">${posts.map((p) => postHTML(p)).join('') || '<div class="empty">Пока пусто — будь первым! 🍊</div>'}</div>`;
+  let postImage = null;
+  $('#post-img').onchange = (e) => {
+    const f = e.target.files[0];
+    if (!f) return;
+    $('#post-img-name').textContent = f.name.slice(0, 30);
+    fileToDataUrl(f, (url) => { postImage = url; if (!url) { postImage = null; $('#post-img-name').textContent = 'файл не поддержан'; } });
+  };
+  $('#post-send').onclick = async () => {
+    const text = $('#post-text').value.trim();
+    if (!text && !postImage) return toast('Пост пустой');
+    try {
+      await api('POST', '/api/posts', { text, image: postImage });
+      toast('Опубликовано 🍊');
+      render();
+    } catch (err) { toast(err.message); }
+  };
+}
+
+async function toggleLike(btn) {
+  if (!me()) return nav('auth');
+  try {
+    const r = await api('POST', '/api/posts/' + btn.dataset.like + '/like');
+    btn.classList.toggle('liked', r.liked);
+    btn.querySelector('.lc').textContent = r.likes;
+  } catch (e) { toast(e.message); }
+}
+
+async function toggleComments(btn) {
+  const id = btn.dataset.cmt;
+  const box = document.getElementById('cbox-' + id);
+  if (!box) return;
+  if (!box.hidden) { box.hidden = true; return; }
+  box.hidden = false;
+  try {
+    const r = await api('GET', '/api/posts/' + id + '/comments');
+    box.innerHTML = `
+      <div class="clist">${(r.comments || []).map((c) => `
+        <div class="cmt">${avatarHTML(c, 24)}<div><b style="color:${esc(c.avatar_color)}">${esc(c.username)}</b> <span>${esc(c.text)}</span></div></div>`).join('') || '<div class="muted tiny">Пока нет комментариев</div>'}</div>
+      <form class="c-form"><input placeholder="Твой комментарий…" maxlength="300" autocomplete="off"><button class="btn small">➤</button></form>`;
+    box.querySelector('.c-form').onsubmit = async (ev) => {
+      ev.preventDefault();
+      const text = ev.target.querySelector('input').value.trim();
+      if (!text) return;
+      try {
+        const rr = await api('POST', '/api/posts/' + id + '/comments', { text });
+        box.querySelector('.clist').insertAdjacentHTML('beforeend',
+          `<div class="cmt">${avatarHTML(rr.comment, 24)}<div><b style="color:${esc(rr.comment.avatar_color)}">${esc(rr.comment.username)}</b> <span>${esc(rr.comment.text)}</span></div></div>`);
+        ev.target.reset();
+        const cc = btn.querySelector('.cc');
+        cc.textContent = (parseInt(cc.textContent) || 0) + 1;
+      } catch (e) { toast(e.message); }
+    };
+  } catch (e) { box.hidden = true; toast(e.message); }
+}
+
+/* ============================== открытия ============================== */
+const guildRow = (g) => `
+  <div class="row" data-guild="${esc(g.id)}">
+    <div class="notif-icon">🛡</div>
+    <div class="row-main">
+      <div class="row-title">${esc(g.name)} ${g.tag ? `<span class="tag">${esc(g.tag)}</span>` : ''}</div>
+      <div class="row-sub">${esc(g.description || '').slice(0, 60)}</div>
+    </div>
+    <span class="muted small">👥 ${g.members}</span>
+  </div>`;
+
+async function renderDiscover(scr) {
+  header('Открытия');
+  $('#nav').style.display = '';
+  const d = await api('GET', '/api/discover');
+  const m = me();
+  scr.innerHTML = `
+    <div class="section-title">🔥 Игры в эфире</div>
+    <div class="chips">${(d.games || []).map((g) => `<span class="chip">${gameIcon(g.game)} ${esc(g.game)} · ${g.c}</span>`).join('') || '<span class="muted">Пока никто не стримит</span>'}</div>
+    <div class="section-title">⭐ Топ стримеров</div>
+    <div class="list">${(d.top_streamers || []).map((u) => `
+      <div class="row">
+        ${avatarHTML(u, 44)}
+        <div class="row-main" data-user="${esc(u.username)}">
+          <div class="row-title">${esc(u.username)} ${u.is_live ? '<span class="live-dot">LIVE</span>' : ''}</div>
+          <div class="row-sub">👥 ${u.followers} подписчиков${u.bio ? ' · ' + esc(u.bio.slice(0, 40)) : ''}</div>
+        </div>
+        ${u.username !== m?.username ? `
+          <button class="btn small" data-follow="${esc(u.username)}">Подписаться</button>
+          <button class="btn small ghost" data-dm="${esc(u.username)}" title="Написать">💬</button>` : ''}
+      </div>`).join('')}</div>
+    <div class="section-title">🛡 Гильдии</div>
+    ${m ? '<button id="btn-gcreate" class="btn ghost full">＋ Создать гильдию</button><div id="gcreate-box"></div>' : ''}
+    <div class="list">${(d.guilds || []).map(guildRow).join('') || '<div class="empty">Гильдий пока нет — создай первую!</div>'}</div>`;
+  const gc = $('#btn-gcreate');
+  if (gc) gc.onclick = () => {
+    $('#gcreate-box').innerHTML = `
+      <form id="gf" class="card">
+        <div class="row-sub" style="margin-bottom:10px">Название (3–24), тег (до 5 симв.) и описание</div>
+        <input id="gf-name" placeholder="Название гильдии" maxlength="24" required>
+        <input id="gf-tag" placeholder="Тег, напр. OML" maxlength="5" style="margin:10px 0">
+        <input id="gf-desc" placeholder="Описание" maxlength="300" style="margin-bottom:10px">
+        <button class="btn">Создать</button>
+      </form>`;
+    $('#gf').onsubmit = async (e) => {
+      e.preventDefault();
+      try {
+        const r = await api('POST', '/api/guilds', { name: $('#gf-name').value.trim(), tag: $('#gf-tag').value.trim(), description: $('#gf-desc').value });
+        toast('Гильдия создана!');
+        nav('guild', { guildId: r.guild.id });
+      } catch (err) { toast(err.message); }
+    };
+  };
+}
+
+async function toggleFollow(username, btn) {
+  if (!me()) return nav('auth');
+  try {
+    const info = await api('GET', '/api/users/' + encodeURIComponent(username));
+    if (info.is_following) {
+      await api('DELETE', '/api/users/' + encodeURIComponent(username) + '/follow');
+      if (btn) btn.textContent = 'Подписаться';
+      toast('Вы отписались от ' + username);
+    } else {
+      await api('POST', '/api/users/' + encodeURIComponent(username) + '/follow');
+      if (btn) btn.textContent = 'Отписаться';
+      toast('Вы подписались на ' + username);
+    }
+  } catch (e) { toast(e.message); }
+}
+
+async function toggleGuild(id) {
+  if (!me()) return nav('auth');
+  try {
+    const r = await api('POST', '/api/guilds/' + id + '/join');
+    toast(r.joined ? 'Вы вступили в гильдию 🛡' : 'Вы покинули гильдию');
+    if (state.screen === 'guild') render();
+  } catch (e) { toast(e.message); }
+}
+
+/* ============================== эфиры ============================== */
+const streamRow = (s) => `
+  <div class="row" data-stream="${esc(s.id)}" style="cursor:pointer">
+    <div class="notif-icon">${gameIcon(s.game)}</div>
+    <div class="row-main">
+      <div class="row-title">${esc(s.title)} <span class="live-dot">LIVE</span></div>
+      <div class="row-sub">${esc(s.host_username)} · 👁 ${s.viewers} · ${timeAgo(s.started_at)}</div>
+    </div>
+    <button class="btn small">Смотреть</button>
+  </div>`;
+
+const streamRowEnded = (s) => `
+  <div class="row">
+    <div class="notif-icon">📺</div>
+    <div class="row-main">
+      <div class="row-title">${esc(s.title)}</div>
+      <div class="row-sub">${esc(s.host_username)} · завершился ${timeAgo(s.ended_at)}</div>
+    </div>
+  </div>`;
+
+async function renderLive(scr) {
+  header('⏺ Эфиры');
+  $('#nav').style.display = '';
+  const d = await api('GET', '/api/streams');
+  scr.innerHTML = `
+    ${me() ? '<button id="btn-golive" class="btn big full">⏺ Go Live — начать эфир</button>' : '<div class="empty">Войдите, чтобы стримить и смотреть эфиры</div>'}
+    <div class="section-title">🔴 В эфире сейчас</div>
+    <div class="list">${(d.live || []).map(streamRow).join('') || '<div class="empty">Никто не стримит. Стань первым! ⏺</div>'}</div>
+    <div class="section-title">📺 Недавние</div>
+    <div class="list">${(d.recent || []).slice(0, 15).map(streamRowEnded).join('') || ''}</div>`;
+  const go = $('#btn-golive');
+  if (go) go.onclick = () => nav('golive');
+}
+
+async function renderGoLive(scr) {
+  if (!me()) return nav('auth');
+  header('Настройка эфира', 'live');
+  const games = (await api('GET', '/api/games')).games;
+  scr.innerHTML = `
+    <div class="card">
+      <div class="section-title" style="margin-top:0">Новый эфир</div>
+      <form id="golive-form">
+        <input id="gl-title" placeholder="Название эфира" maxlength="100" required>
+        <select id="gl-game">${games.map((g) => `<option>${esc(g)}</option>`).join('')}</select>
+        <input id="gl-rtmp" placeholder="RTMP URL для Twitch/YouTube (необязательно)">
+        <div class="muted small" style="margin:8px 0 14px">Например: rtmp://live.twitch.tv/app/ВАШ_КЛЮЧ — картинка пойдёт и в веб-чат, и на Twitch (эксперимент). Без RTMP стрим идёт только внутри Omlet Arcade PC.</div>
+        <button class="btn big full" style="margin:0">⏺ В эфир!</button>
+      </form>
+    </div>`;
+  $('#golive-form').onsubmit = async (e) => {
+    e.preventDefault();
+    try {
+      state.rtmpUrl = $('#gl-rtmp').value.trim() || null;
+      const d = await api('POST', '/api/streams', { title: $('#gl-title').value, game: $('#gl-game').value, rtmp_url: state.rtmpUrl });
+      nav('watch', { watchId: d.stream.id, watchMode: 'host' });
+    } catch (err) { toast(err.message); }
+  };
+}
+
+/* ---------- просмотр / хостинг эфира ---------- */
+function addChat(m) {
+  const c = $('#chat');
+  if (!c || !m.user) return;
+  const d = document.createElement('div');
+  d.className = 'chat-msg';
+  d.innerHTML = `${avatarHTML(m.user, 26)}<div><b style="color:${esc(m.user.avatar_color || '#ccc')}">${esc(m.user.username)}</b> <span>${esc(m.text)}</span></div>`;
+  c.appendChild(d);
+  c.scrollTop = c.scrollHeight;
+}
+
+async function renderWatch(scr) {
+  const d = await api('GET', '/api/streams/' + state.watchId);
+  const s = d.stream;
+  const host = state.watchMode === 'host';
+  if (s.status !== 'live') {
+    header(s.title, 'live');
+    scr.innerHTML = `<div class="card center"><div style="font-size:40px">📺</div><div class="section-title">Этот эфир уже завершился</div><button class="btn" data-nav="live">К списку эфиров</button></div>`;
+    return;
+  }
+  header(s.title, 'live');
+  scr.innerHTML = `
+    <div class="video-wrap">
+      <video id="video" autoplay playsinline muted></video>
+      <div id="voverlay" class="voverlay">${host ? 'Выбери окно/экран для захвата…' : 'Ожидание видео…'}</div>
+      <div class="vstats">🔴 LIVE · 👁 <span id="vcount">…</span></div>
+    </div>
+    ${host ? `
+      <div class="card">
+        <div style="display:flex;gap:10px;flex-wrap:wrap">
+          <button id="btn-rtmp" class="btn">📺 Ретрансляция на Twitch/YouTube</button>
+          <button id="btn-end" class="btn danger">⏹ Завершить эфир</button>
+        </div>
+        <div id="rtmp-status" class="muted small" style="margin-top:8px">${s.rtmp_url ? 'RTMP: ' + esc(s.rtmp_url) : 'Без RTMP — только внутренний эфир'}</div>
+      </div>` : `
+      <div class="row">
+        ${avatarHTML({ username: s.host_username, avatar_color: s.host_color }, 42)}
+        <div class="row-main" data-user="${esc(s.host_username)}">
+          <div class="row-title">${esc(s.host_username)}</div>
+          <div class="row-sub">👥 ${d.host_followers} подписчиков</div>
+        </div>
+        <button class="btn small" data-follow="${esc(s.host_username)}">Подписаться</button>
+      </div>`}
+    <div class="section-title">Чат эфира</div>
+    <div id="chat" class="chat"></div>
+    ${me() ? '<form id="chat-form" class="chat-form"><input id="chat-input" placeholder="Написать в чат…" maxlength="300" autocomplete="off"><button class="btn">➤</button></form>'
+      : '<div class="empty">Войдите, чтобы писать в чат</div>'}`;
+  (d.messages || []).forEach((m) => addChat({ text: m.text, user: { username: m.username, avatar_color: m.avatar_color } }));
+  const video = $('#video');
+  video.onclick = () => { video.muted = !video.muted; toast(video.muted ? '🔇 Звук выключен' : '🔊 Звук включен'); };
+  $('#btn-end') && ($('#btn-end').onclick = endHostStream);
+  $('#btn-rtmp') && ($('#btn-rtmp').onclick = () => toggleRtmp());
+  $('#chat-form') && ($('#chat-form').onsubmit = (e) => {
+    e.preventDefault();
+    const text = $('#chat-input').value.trim();
+    if (!text || !streamWS || streamWS.readyState !== 1) return;
+    $('#chat-input').value = '';
+    streamWS.send(JSON.stringify({ type: 'chat', text }));
+  });
+  connectStreamWS(s, host);
+}
+
+function connectStreamWS(s, host) {
+  const proto = location.protocol === 'https:' ? 'wss://' : 'ws://';
+  streamWS = new WebSocket(`${proto}${location.host}/ws?stream=${s.id}&token=${tok()}`);
+  streamWS.binaryType = 'arraybuffer';
+
+  streamWS.onopen = () => {
+    if (!host) {
+      streamWS.send(JSON.stringify({ type: 'ready' }));
+      // переподключение сигнала, если хост ещё не начал захват
+      let tries = 0;
+      readyTimer = setInterval(() => {
+        if (++tries > 6 || state.screen !== 'watch' || host) { clearInterval(readyTimer); return; }
+        const v = $('#video');
+        if (v && !v.srcObject) streamWS.send(JSON.stringify({ type: 'ready' }));
+      }, 7000);
+    }
+  };
+
+  streamWS.onmessage = async (ev) => {
+    let m; try { m = JSON.parse(ev.data); } catch { return; }
+    switch (m.type) {
+      case 'welcome':
+      case 'host-welcome': {
+        const v = $('#vcount'); if (v) v.textContent = m.viewers;
+        if (host) await startScreenShare(s);
+        break;
+      }
+      case 'viewers': { const v = $('#vcount'); if (v) v.textContent = m.count; break; }
+      case 'peer-joined': {
+        if (host) {
+          if (screenStream) createHostPC(m.peerId);
+          else pendingPeers.add(m.peerId);
+        }
+        break;
+      }
+      case 'signal': {
+        if (host) {
+          const pc = pcs.get(m.from);
+          if (!pc) break;
+          if (m.data.desc) await pc.setRemoteDescription(m.data.desc).catch(() => {});
+          if (m.data.candidate) await pc.addIceCandidate(m.data.candidate).catch(() => {});
+        } else {
+          if (!viewerPC) viewerPC = createViewerPC();
+          if (m.data.desc) {
+            await viewerPC.setRemoteDescription(m.data.desc).catch(() => {});
+            if (m.data.desc.type === 'offer') {
+              const ans = await viewerPC.createAnswer();
+              await viewerPC.setLocalDescription(ans);
+              streamWS.send(JSON.stringify({ type: 'signal', to: 'host', data: { desc: ans } }));
+            }
+          }
+          if (m.data.candidate) await viewerPC.addIceCandidate(m.data.candidate).catch(() => {});
+        }
+        break;
+      }
+      case 'chat': addChat(m); break;
+      case 'error': toast(m.message === 'login_required' ? 'Войдите, чтобы писать в чат' : String(m.message)); break;
+      case 'rtmp-status': rtmpStatus(m); break;
+      case 'stream-ended': onStreamEnded(); break;
+    }
+  };
+
+  streamWS.onclose = () => {
+    clearInterval(readyTimer);
+    if (state.screen === 'watch') setTimeout(() => { if (state.screen === 'watch') render(); }, 2500);
+  };
+}
+
+function createViewerPC() {
+  const pc = new RTCPeerConnection({ iceServers: [{ urls: 'stun:stun.l.google.com:19302' }] });
+  pc.ontrack = (e) => {
+    const v = $('#video');
+    if (v) {
+      v.srcObject = e.streams[0];
+      $('#voverlay') && ($('#voverlay').style.display = 'none');
+    }
+  };
+  pc.onicecandidate = (e) => {
+    if (e.candidate && streamWS && streamWS.readyState === 1) {
+      streamWS.send(JSON.stringify({ type: 'signal', to: 'host', data: { candidate: e.candidate.toJSON() } }));
+    }
+  };
+  return pc;
+}
+
+function createHostPC(peerId) {
+  if (!screenStream) return;
+  const pc = new RTCPeerConnection({ iceServers: [{ urls: 'stun:stun.l.google.com:19302' }] });
+  pcs.set(peerId, pc);
+  for (const t of screenStream.getTracks()) { try { pc.addTrack(t, screenStream); } catch {} }
+  pc.onicecandidate = (e) => {
+    if (e.candidate && streamWS && streamWS.readyState === 1) {
+      streamWS.send(JSON.stringify({ type: 'signal', to: peerId, data: { candidate: e.candidate.toJSON() } }));
+    }
+  };
+  pc.onconnectionstatechange = () => {
+    if (['failed', 'closed', 'disconnected'].includes(pc.connectionState)) pcs.delete(peerId);
+  };
+  pc.createOffer().then(async (offer) => {
+    await pc.setLocalDescription(offer);
+    streamWS && streamWS.readyState === 1 && streamWS.send(JSON.stringify({ type: 'signal', to: peerId, data: { desc: pc.localDescription } }));
+  }).catch(() => pcs.delete(peerId));
+}
+
+async function startScreenShare(s) {
+  if (screenStream) return;
+  try {
+    screenStream = await navigator.mediaDevices.getDisplayMedia({ video: { frameRate: 30 }, audio: true });
+  } catch { toast('Захват экрана отменён — эфир без видео'); }
+  if (!screenStream) return;
+  const v = $('#video');
+  if (v) { v.srcObject = screenStream; v.muted = true; }
+  const ov = $('#voverlay'); if (ov) ov.style.display = 'none';
+  screenStream.getVideoTracks()[0].onended = endHostStream; // нажали «Остановить показ»
+  for (const id of pendingPeers) createHostPC(id);
+  pendingPeers.clear();
+  if (s.rtmp_url) toggleRtmp(); // авто-включение ретрансляции
+}
+
+function pickMime() {
+  for (const m of ['video/webm;codecs=vp8,opus', 'video/webm']) {
+    if (window.MediaRecorder && MediaRecorder.isTypeSupported(m)) return m;
+  }
+  return '';
+}
+
+function startRecorder() {
+  if (!screenStream) return;
+  const mime = pickMime();
+  try {
+    recorder = mime ? new MediaRecorder(screenStream, { mimeType: mime, videoBitsPerSecond: 2500000 }) : new MediaRecorder(screenStream);
+  } catch (e) { $('#rtmp-status').textContent = '🔴 MediaRecorder не поддержан: ' + e.message; return; }
+  recorder.ondataavailable = (e) => {
+    if (!e.data.size || !rtmpActive) return;
+    e.data.arrayBuffer().then((buf) => {
+      if (!rtmpActive || !streamWS || streamWS.readyState !== 1) return;
+      const frame = new Uint8Array(buf.byteLength + 1);
+      frame[0] = 1; // маркер RTMP-чанка для сервера
+      frame.set(new Uint8Array(buf), 1);
+      streamWS.send(frame);
+    });
+  };
+  recorder.start(1000);
+}
+
+function toggleRtmp() {
+  if (!streamWS || streamWS.readyState !== 1) return;
+  if (rtmpActive) {
+    rtmpActive = false;
+    try { recorder && recorder.stop(); } catch {}
+    streamWS.send(JSON.stringify({ type: 'rtmp-stop' }));
+    const el = $('#rtmp-status'); if (el) el.textContent = 'Ретрансляция выключена';
+    const b = $('#btn-rtmp'); if (b) b.textContent = '📺 Ретрансляция на Twitch/YouTube';
+    return;
+  }
+  if (!state.rtmpUrl) {
+    const el = $('#rtmp-status');
+    if (el) el.textContent = '🔴 RTMP URL не задан — укажи его при создании эфира';
+    return;
+  }
+  streamWS.send(JSON.stringify({ type: 'rtmp-start', url: state.rtmpUrl }));
+}
+
+function rtmpStatus(m) {
+  const el = $('#rtmp-status'); if (!el) return;
+  if (m.ok) {
+    rtmpActive = true;
+    startRecorder();
+    el.textContent = '🟢 Ретрансляция включена — видео уходит на внешний сервис';
+    const b = $('#btn-rtmp'); if (b) b.textContent = '⏹ Отключить ретрансляцию';
+    toast('📺 Стрим ретранслируется на Twitch/YouTube');
+  } else {
+    const msgs = { ffmpeg_unavailable: 'на сервере нет ffmpeg — ретрансляция недоступна', bad_url: 'неверный RTMP URL (должен начинаться с rtmp:// или rtmps://)' };
+    el.textContent = '🔴 ' + (msgs[m.error] || m.error);
+  }
+}
+
+async function endHostStream() {
+  try { await api('POST', '/api/streams/' + state.watchId + '/end'); } catch {}
+  cleanupStream();
+  toast('Эфир завершён 🍊');
+  nav('live');
+}
+
+function onStreamEnded() {
+  toast('Стрим завершился');
+  cleanupStream();
+  nav('live');
+}
+
+function cleanupStream() {
+  clearInterval(readyTimer);
+  try { recorder && recorder.state !== 'inactive' && recorder.stop(); } catch {}
+  recorder = null;
+  rtmpActive = false;
+  try { screenStream && screenStream.getTracks().forEach((t) => t.stop()); } catch {}
+  screenStream = null;
+  for (const pc of pcs.values()) { try { pc.close(); } catch {} }
+  pcs.clear();
+  pendingPeers.clear();
+  if (viewerPC) { try { viewerPC.close(); } catch {} viewerPC = null; }
+  try { streamWS && streamWS.close(); } catch {}
+  streamWS = null;
+}
+
+/* ============================== сообщения ============================== */
+function dmBubble(m) {
+  const mine = m.sender_id === me()?.id;
+  return `<div class="dm-bubble ${mine ? 'mine' : ''}"><div class="bubble">${esc(m.text)}</div><div class="muted tiny">${timeAgo(m.created_at)}</div></div>`;
+}
+
+async function refreshDmUnread() {
+  try {
+    const d = await api('GET', '/api/dm/contacts');
+    dmUnread = (d.contacts || []).reduce((s, c) => s + (c.unread || 0), 0);
+    updateBadges();
+  } catch {}
+}
+
+async function renderMessages(scr) {
+  header('Сообщения');
+  $('#nav').style.display = '';
+  const d = await api('GET', '/api/dm/contacts');
+  scr.innerHTML = `
+    <form id="dm-new" class="dm-new">
+      <input id="dm-new-name" placeholder="Ник пользователя, напримерalice" autocomplete="off">
+      <button class="btn">Начать чат</button>
+    </form>
+    <div class="list">${(d.contacts || []).map((c) => `
+      <div class="row" data-user="${esc(c.username)}" style="cursor:pointer">
+        ${avatarHTML(c, 46)}
+        <div class="row-main">
+          <div class="row-title">${esc(c.username)}${c.unread ? ` <span class="pill">${c.unread}</span>` : ''}</div>
+          <div class="row-sub">${esc((c.last_text || '').slice(0, 50))}</div>
+        </div>
+        <div class="muted tiny">${timeAgo(c.last_at)}</div>
+      </div>`).join('') || '<div class="empty">Чатов нет. Найди кого-нибудь в Открытиях! 💬</div>'}</div>`;
+  $('#dm-new').onsubmit = async (e) => {
+    e.preventDefault();
+    const name = $('#dm-new-name').value.trim();
+    if (!name) return;
+    try {
+      await api('GET', '/api/users/' + encodeURIComponent(name));
+      nav('dialog', { dialogUser: name });
+    } catch { toast('Пользователь не найден'); }
+  };
+  refreshDmUnread();
+}
+
+async function renderDialog(scr) {
+  const name = state.dialogUser;
+  header('💬 ' + name, 'messages');
+  const d = await api('GET', '/api/dm/' + encodeURIComponent(name));
+  scr.innerHTML = `
+    <div class="dm-head">${avatarHTML(d.peer, 42)}<div><b>${esc(d.peer.username)}</b><div class="muted small">${esc(d.peer.bio || '')}</div></div></div>
+    <div id="dm-list" class="dm-list">${(d.messages || []).map(dmBubble).join('')}</div>
+    <form id="dm-form" class="chat-form"><input id="dm-input" placeholder="Сообщение…" maxlength="1000" autocomplete="off"><button class="btn">➤</button></form>`;
+  const list = $('#dm-list');
+  list.scrollTop = list.scrollHeight;
+  $('#dm-form').onsubmit = async (e) => {
+    e.preventDefault();
+    const text = $('#dm-input').value.trim();
+    if (!text) return;
+    $('#dm-input').value = '';
+    try {
+      const r = await api('POST', '/api/dm/' + encodeURIComponent(name), { text });
+      list.insertAdjacentHTML('beforeend', dmBubble({ sender_id: me().id, text, created_at: r.message.created_at }));
+      list.scrollTop = list.scrollHeight;
+    } catch (err) { toast(err.message); }
+  };
+  refreshDmUnread(); // открытие диалога = прочтение на сервере
+}
+
+/* ============================== уведомления ============================== */
+async function openNotifications() {
+  let d;
+  try { d = await api('GET', '/api/notifications'); } catch (e) { return toast(e.message); }
+  notifUnread = 0;
+  updateBadges();
+  api('POST', '/api/notifications/read').catch(() => {});
+  const items = (d.notifications || []).map((n) => {
+    const p = n.payload || {};
+    const icon = { live: '🔴', like: '❤️', comment: '💬', follow: '➕' }[n.type] || '🔔';
+    const text = {
+      live: `${p.host} начал эфир: ${p.title}`,
+      like: `${p.by} лайкнул твой пост`,
+      comment: `${p.by} прокомментировал: ${(p.text || '').slice(0, 40)}`,
+      follow: `${p.by} подписался на тебя`,
+    }[n.type] || n.type;
+    const attrs = n.type === 'live' && p.stream_id ? `data-stream="${esc(p.stream_id)}" style="cursor:pointer"` : p.by ? `data-user="${esc(p.by)}" style="cursor:pointer"` : '';
+    return `<div class="row notif ${n.unread ? 'unread' : ''}" ${attrs}>
+      <div class="notif-icon">${icon}</div>
+      <div class="row-main"><div class="row-title">${esc(text)}</div><div class="muted tiny">${timeAgo(n.created_at)}</div></div>
+    </div>`;
+  }).join('');
+  modal(items || '<div class="empty">Уведомлений пока нет 🔔</div>', 'Уведомления');
+}
+
+/* ============================== профиль ============================== */
+async function renderProfile(scr) {
+  const m = me();
+  header('Профиль');
+  $('#nav').style.display = '';
+  const d = await api('GET', '/api/users/' + encodeURIComponent(m.username));
+  state.selColor = d.user.avatar_color;
+  const posts = (d.posts || []).map((p) => ({ ...p, username: d.user.username, avatar_color: d.user.avatar_color }));
+  const streams = (d.streams || []).map((s) => ({ ...s, host_username: d.user.username }));
+  scr.innerHTML = `
+    <div class="card center">
+      ${avatarHTML(d.user, 84)}
+      <div class="big-name">${esc(d.user.username)}</div>
+      <div class="row-sub" style="white-space:normal">${esc(d.user.bio || 'Расскажи о себе…')}</div>
+      <div class="stats">
+        <div><b>${d.followers}</b><span>подписчиков</span></div>
+        <div><b>${d.following}</b><span>подписки</span></div>
+        <div><b>${d.streams_total}</b><span>эфиров</span></div>
+      </div>
+      <div class="colors">${COLORS.map((c) => `<button class="color-dot ${c === d.user.avatar_color ? 'sel' : ''}" data-color="${c}" style="background:${c}"></button>`).join('')}</div>
+      <form id="bio-form" style="display:flex;gap:8px">
+        <input id="bio-input" value="${esc(d.user.bio)}" placeholder="О себе (до 200)" maxlength="200">
+        <button class="btn">Сохранить</button>
+      </form>
+    </div>
+    <div class="section-title">⏺ Мои эфиры</div>
+    <div class="list">${streams.map((s) => s.status === 'live' ? streamRow(s) : streamRowEnded(s)).join('') || '<div class="empty muted">Ещё не стримил</div>'}</div>
+    <div class="section-title">📰 Мои посты</div>
+    <div>${posts.map((p) => postHTML(p)).join('') || '<div class="empty muted">Постов нет</div>'}</div>
+    <button id="btn-logout" class="btn danger full" style="margin-top:16px">🚪 Выйти из аккаунта</button>`;
+  scr.querySelectorAll('.color-dot').forEach((b) => b.onclick = () => {
+    state.selColor = b.dataset.color;
+    scr.querySelectorAll('.color-dot').forEach((x) => x.classList.toggle('sel', x === b));
+  });
+  $('#bio-form').onsubmit = async (e) => {
+    e.preventDefault();
+    try {
+      const r = await api('PATCH', '/api/me', { bio: $('#bio-input').value, avatar_color: state.selColor });
+      setAuth(tok(), r.user);
+      toast('Профиль сохранён ✅');
+    } catch (err) { toast(err.message); }
+  };
+  $('#btn-logout').onclick = logout;
+}
+
+async function renderUser(scr) {
+  const d = await api('GET', '/api/users/' + encodeURIComponent(state.user));
+  header('@' + d.user.username, 'discover');
+  const posts = (d.posts || []).map((p) => ({ ...p, username: d.user.username, avatar_color: d.user.avatar_color }));
+  const streams = (d.streams || []).map((s) => ({ ...s, host_username: d.user.username }));
+  scr.innerHTML = `
+    <div class="card center">
+      ${avatarHTML(d.user, 84)}
+      <div class="big-name">${esc(d.user.username)}</div>
+      <div class="row-sub" style="white-space:normal">${esc(d.user.bio || '')}</div>
+      ${d.live_stream_id ? `<button class="btn big" data-stream="${esc(d.live_stream_id)}" style="margin:10px 0">🔴 Смотреть эфир!</button>` : ''}
+      <div class="stats">
+        <div><b>${d.followers}</b><span>подписчиков</span></div>
+        <div><b>${d.following}</b><span>подписки</span></div>
+        <div><b>${d.streams_total}</b><span>эфиров</span></div>
+      </div>
+      ${me() && me().username !== d.user.username ? `
+      <div style="display:flex;gap:8px;justify-content:center">
+        <button class="btn" data-follow="${esc(d.user.username)}">${d.is_following ? 'Отписаться' : 'Подписаться'}</button>
+        <button class="btn ghost" data-dm="${esc(d.user.username)}">💬 Написать</button>
+      </div>` : ''}
+    </div>
+    <div class="section-title">⏺ Эфиры</div>
+    <div class="list">${streams.map((s) => s.status === 'live' ? streamRow(s) : streamRowEnded(s)).join('') || '<div class="empty muted">Пока нет эфиров</div>'}</div>
+    <div class="section-title">📰 Посты</div>
+    <div>${posts.map((p) => postHTML(p)).join('') || '<div class="empty muted">Постов нет</div>'}</div>`;
+}
+
+/* ============================== гильдии ============================== */
+function addGuildChat(m) {
+  const c = $('#gchat');
+  if (!c || !m.user) return;
+  const d = document.createElement('div');
+  d.className = 'chat-msg';
+  d.innerHTML = `${avatarHTML(m.user, 26)}<div><b style="color:${esc(m.user.avatar_color || '#ccc')}">${esc(m.user.username)}</b> <span>${esc(m.text)}</span></div>`;
+  c.appendChild(d);
+  c.scrollTop = c.scrollHeight;
+}
+
+async function renderGuild(scr) {
+  const d = await api('GET', '/api/guilds/' + state.guildId);
+  header('🛡 ' + d.guild.name, 'discover');
+  scr.innerHTML = `
+    <div class="card">
+      <div class="row-title" style="font-size:17px">${esc(d.guild.name)} ${d.guild.tag ? `<span class="tag">${esc(d.guild.tag)}</span>` : ''}</div>
+      <div class="row-sub" style="white-space:normal;margin:6px 0">${esc(d.guild.description || '')}</div>
+      <div class="row-sub">👑 ${esc(d.guild.owner_username || '')} · 👥 ${d.guild.member_count} участников</div>
+      <div style="margin-top:12px">
+        ${me()?.username === d.guild.owner_username
+          ? '<span class="tag">Ты владелец этой гильдии</span>'
+          : me() ? `<button class="btn" data-gjoin="${esc(d.guild.id)}">${d.joined ? 'Покинуть гильдию' : 'Вступить в гильдию'}</button>`
+          : '<div class="muted small">Войдите, чтобы вступить</div>'}
+      </div>
+    </div>
+    <div class="section-title">Участники</div>
+    <div class="list">${(d.members || []).map((mem) => `
+      <div class="row">
+        ${avatarHTML(mem, 36)}
+        <div class="row-main" data-user="${esc(mem.username)}">
+          <div class="row-title">${esc(mem.username)}</div>
+          <div class="row-sub">${mem.role === 'owner' ? '👑 владелец' : 'участник'}</div>
+        </div>
+        ${me() && mem.username !== me().username ? `<button class="btn small ghost" data-dm="${esc(mem.username)}">💬</button>` : ''}
+      </div>`).join('')}</div>
+    <div class="section-title">Чат гильдии</div>
+    <div id="gchat" class="chat"></div>
+    ${me() ? '<form id="gchat-form" class="chat-form"><input id="gchat-input" placeholder="Сообщение в гильдию…" maxlength="300" autocomplete="off"><button class="btn">➤</button></form>'
+      : '<div class="empty">Войдите, чтобы писать в чат гильдии</div>'}`;
+  (d.messages || []).forEach((m) => addGuildChat({ text: m.text, user: { username: m.username, avatar_color: m.avatar_color } }));
+  const proto = location.protocol === 'https:' ? 'wss://' : 'ws://';
+  guildWS = new WebSocket(`${proto}${location.host}/ws?guild=${d.guild.id}&token=${tok()}`);
+  guildWS.onmessage = (ev) => {
+    let m; try { m = JSON.parse(ev.data); } catch { return; }
+    if (m.type === 'chat') addGuildChat(m);
+  };
+  const f = $('#gchat-form');
+  if (f) f.onsubmit = (e) => {
+    e.preventDefault();
+    const text = $('#gchat-input').value.trim();
+    if (!text || !guildWS || guildWS.readyState !== 1) return;
+    $('#gchat-input').value = '';
+    guildWS.send(JSON.stringify({ type: 'chat', text }));
+  };
+}
+
+/* ============================== запуск ============================== */
+window.addEventListener('DOMContentLoaded', async () => {
+  if (tok()) {
+    try {
+      const d = await api('GET', '/api/me');
+      setAuth(tok(), d.user);
+      notifUnread = d.unread || 0;
+      connectWS();
+      nav('home');
+    } catch {
+      localStorage.removeItem('omlet_token');
+      localStorage.removeItem('omlet_user');
+      nav('auth');
+    }
+  } else {
+    nav('auth');
+  }
+});
