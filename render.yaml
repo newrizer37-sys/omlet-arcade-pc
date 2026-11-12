@@ -3,7 +3,7 @@ services:
     name: omlet-arcade-pc
     runtime: node
     plan: free
-    buildCommand: npm install
+    buildCommand: npm install && (node node_modules/ffmpeg-static/install.js || echo "ffmpeg skipped")
     startCommand: node server.js
     healthCheckPath: /api/health
     autoDeploy: true
