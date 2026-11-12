@@ -5,6 +5,7 @@ import fs from 'node:fs';
 import crypto from 'node:crypto';
 import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
+import { createRequire } from 'node:module';
 import { WebSocketServer } from 'ws';
 import { db, initDb } from './src/db.js';
 import {
@@ -16,7 +17,11 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const PORT = process.env.PORT || 3000;
 const GAMES = ['Minecraft PE', 'Roblox', 'PUBG Mobile', 'Standoff 2', 'Genshin Impact', 'Brawl Stars', 'Free Fire', 'Другое'];
 const AVATAR_COLORS = ['#FF7A00', '#FF4D4D', '#2ECC71', '#3498DB', '#9B59B6', '#F1C40F', '#1ABC9C', '#E91E63'];
-const FFMPEG = process.env.FFMPEG_PATH || path.join(__dirname, 'bin', 'ffmpeg');
+const FFMPEG = process.env.FFMPEG_PATH
+  || (() => {
+    try { return createRequire(import.meta.url)('ffmpeg-static'); } catch { /* пакет не установлен */ }
+    return path.join(__dirname, 'bin', 'ffmpeg');
+  })();
 const HAS_FFMPEG = fs.existsSync(FFMPEG);
 if (!HAS_FFMPEG) console.log('[rtmp] ffmpeg не найден — стрим на Twitch недоступен (experimental)');
 
